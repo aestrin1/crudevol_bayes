@@ -1,0 +1,961 @@
+---
+title: 'Brent Volatility Dynamics: A Bayesian Analysis'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(quantmod)
+library(cmdstanr)
+library(posterior)
+library(tibble)
+library(bayesplot)
+library(ggplot2)
+library(quantmod)
+library(knitr)
+library(gridExtra)
+library(grid)
+library(dplyr)
+library(stringr)
+
+```
+
+```{r}
+brent <- read.csv("https://raw.githubusercontent.com/datasets/oil-prices/main/data/brent-daily.csv")
+colnames(brent) <- c("Date", "Price")
+brent$Date <- as.Date(brent$Date)
+brent$Price <- as.numeric(brent$Price)
+brent <- brent[order(brent$Date), ]
+brent <- brent[is.finite(brent$Price) & brent$Price > 0, ]
+
+lco <- read.csv("lco.csv")
+colnames(lco) <- c("Date","Close","Net","PctChg","Open","Low","High","Volume","OI","Bid","Ask","Expiry")
+lco$Date <- as.Date(lco$Date, format="%d-%b-%Y")
+lco <- lco[order(lco$Date), ]
+lco$Close <- as.numeric(lco$Close)
+lco <- lco[is.finite(lco$Close) & lco$Close > 0, ]
+
+getSymbols("DCOILWTICO", src = "FRED", from = "1987-01-01")
+
+wti <- data.frame(
+  Date = index(DCOILWTICO),
+  Price = as.numeric(DCOILWTICO)
+)
+wti <- wti[is.finite(wti$Price) & wti$Price > 0, ]
+
+r_brent <- diff(log(brent$Price))
+dates_brent <- brent$Date[-1]
+
+r_lco <- diff(log(lco$Close))
+dates_lco <- lco$Date[-1]
+
+r_wti <- diff(log(wti$Price))
+dates_wti <- wti$Date[-1]
+
+common_bw <- intersect(dates_brent, dates_wti)
+r_b_wti <- r_brent[dates_brent %in% common_bw]
+r_w_wti <- r_wti[dates_wti %in% common_bw]
+
+common_bl <- intersect(dates_brent, dates_lco)
+r_b_lco <- r_brent[dates_brent %in% common_bl]
+r_l_lco <- r_lco[dates_lco %in% common_bl]
+
+length(r_b_wti); length(r_w_wti)
+length(r_b_lco); length(r_l_lco)
+
+
+hist(r_wti, breaks = 100, main = "WTI Log Returns", col = "gray")
+hist(r_brent, breaks = 100, main = "Brent Log Returns", col = "gray")
+```
+
+```{r}
+bw <- merge(
+  data.frame(Date = brent$Date, r_brent = c(NA, diff(log(brent$Price)))),
+  data.frame(Date = wti$Date,   r_wti   = c(NA, diff(log(wti$Price)))),
+  by = "Date",
+  all = FALSE 
+)
+
+bw <- bw[complete.cases(bw), ]
+
+r_brent_bw <- bw$r_brent
+r_wti_bw   <- bw$r_wti
+T_bw       <- nrow(bw)
+
+head(bw)
+
+
+bl <- merge(
+  data.frame(Date = brent$Date, r_brent = c(NA, diff(log(brent$Price)))),
+  data.frame(Date = lco$Date,   r_lco   = c(NA, diff(log(lco$Close)))),
+  by = "Date",
+  all = FALSE
+)
+
+bl <- bl[complete.cases(bl), ]
+
+r_brent_bl <- bl$r_brent
+r_lco_bl   <- bl$r_lco
+T_bl       <- nrow(bl)
+
+head(bl)
+```
+
+```{r}
+bw_long <- bw %>%
+  pivot_longer(cols = c(r_brent, r_wti), names_to = "Benchmark", values_to = "Return")
+
+p_returns <- ggplot(bw_long, aes(x = Date, y = Return, color = Benchmark)) +
+  geom_line(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Daily Log-Returns: Brent vs. WTI",
+       y = "Log Return", x = "Date") +
+  scale_color_manual(values = c("r_brent" = "blue", "r_wti" = "red"))
+
+w_wti_dominant <- bw %>%
+  filter(abs(r_wti) >= abs(r_brent))
+
+p10 <- ggplot(bw_wti_dominant, aes(x = Date)) +
+  geom_point(aes(y = r_wti, color = "WTI Dominant"), alpha = 0.4, size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "WTI Volatility Dominance",
+       y = "Daily Log Return", x = "Year") 
+
+p11 <- ggplot(bw, aes(x = abs(r_brent), y = abs(r_wti))) +
+  geom_point(alpha = 0.2, color = "grey") +
+  geom_point(data = bw_wti_dominant, aes(x = abs(r_brent), y = abs(r_wti)), 
+             color = "red", alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Absolute Return Comparison",
+       x = "|Brent Return| (Volatility Proxy)",
+       y = "|WTI Return| (Volatility Proxy)") 
+
+wti_more_volatile <- sum(abs(bw$r_wti) > abs(bw$r_brent))
+brent_more_volatile <- sum(abs(bw$r_brent) > abs(bw$r_wti))
+ties <- sum(abs(bw$r_wti) == abs(bw$r_brent))
+total_days <- nrow(bw)
+
+cat("Total Observations:", total_days, "\n")
+cat("WTI More Volatile (|r_wti| > |r_brent|):", wti_more_volatile, 
+    "(", round(wti_more_volatile/total_days * 100, 2), "%)\n")
+cat("Brent More Volatile (|r_brent| > |r_wti|):", brent_more_volatile, 
+    "(", round(brent_more_volatile/total_days * 100, 2), "%)\n")
+cat("Ties:", ties, "\n")
+
+extreme_stats <- data.frame(
+  Variable = c("Brent Returns", "WTI Returns"),
+  Min = c(min(bw$r_brent), min(bw$r_wti)),
+  Max = c(max(bw$r_brent), max(bw$r_wti)),
+  Max_Abs = c(max(abs(bw$r_brent)), max(abs(bw$r_wti)))
+)
+
+
+```
+
+
+```{r}
+
+stan_code <- "
+data {
+  int<lower=0> T;
+  vector[T] r_brent;
+  vector[T] r_wti;
+}
+
+parameters {
+  real mu_b;
+  real mu_w;
+  real<lower=0> sigma_b;
+  real<lower=0> sigma_w;
+}
+
+model {
+  mu_b ~ normal(0, 10);
+  mu_w ~ normal(0, 10);
+
+  sigma_b ~ exponential(1);
+  sigma_w ~ exponential(1);
+
+  r_brent ~ normal(mu_b, sigma_b);
+  r_wti   ~ normal(mu_w, sigma_w);
+}
+"
+
+mod <- cmdstan_model(write_stan_file(stan_code))
+
+fit_joint <- mod$sample(
+  data = list(
+    T = T,
+    r_brent = r_brent,
+    r_wti = r_wti
+  ),
+  iter_sampling = 1000,
+  iter_warmup = 1000,
+  chains = 4
+)
+
+post <- fit_joint$draws()
+
+sigma_b <- as_draws_matrix(post)[, "sigma_b"]
+sigma_w <- as_draws_matrix(post)[, "sigma_w"]
+
+summary_stats <- fit_joint$summary(c("sigma_b", "sigma_w"))
+
+
+summary_df <- data.frame(
+  mean_sig_b = summary_stats$mean[summary_stats$variable == "sigma_b"],
+  sd_sig_b   = summary_stats$sd[summary_stats$variable == "sigma_b"],
+  mean_sig_w = summary_stats$mean[summary_stats$variable == "sigma_w"],
+  sd_sig_w   = summary_stats$sd[summary_stats$variable == "sigma_w"],
+  rhat_b     = summary_stats$rhat[summary_stats$variable == "sigma_b"],
+  rhat_w     = summary_stats$rhat[summary_stats$variable == "sigma_w"],
+  prob_gt    = mean(sigma_b > sigma_w) 
+)
+
+
+plot(density(sigma_b), col = "red", main = "Volatility Comparison")
+lines(density(sigma_w), col = "blue")
+
+
+mcmc_trace(fit_joint$draws(c("sigma_b", "sigma_w")))
+
+fit_joint$summary(c("sigma_b", "sigma_w"))
+```
+
+
+
+
+```{r}
+
+r_brent <- as.numeric(r_brent)
+r_wti   <- as.numeric(r_wti)
+
+stan_code <- "
+data {
+  int<lower=0> T;
+  vector[T] r_brent;
+  vector[T] r_wti;
+}
+
+parameters {
+  real mu_b;
+  real mu_w;
+
+  real<lower=0.01, upper=5> sigma_b;
+  real<lower=0.01, upper=5> sigma_w;
+
+  real<lower=2, upper=30> nu_b;
+  real<lower=2, upper=30> nu_w;
+}
+
+model {
+  mu_b ~ normal(0, 10);
+  mu_w ~ normal(0, 10);
+
+  sigma_b ~ normal(0, 1);
+  sigma_w ~ normal(0, 1);
+
+  nu_b ~ gamma(2, 0.1);
+  nu_w ~ gamma(2, 0.1);
+
+  r_brent ~ student_t(nu_b, mu_b, sigma_b);
+  r_wti   ~ student_t(nu_w, mu_w, sigma_w);
+}
+"
+
+mod <- cmdstan_model(write_stan_file(stan_code))
+
+fit <- mod$sample(
+  data = list(
+    T = length(r_brent),
+    r_brent = r_brent,
+    r_wti = r_wti
+  ),
+  iter_sampling = 1000,
+  iter_warmup = 1000,
+  chains = 4
+)
+
+post <- fit$draws()
+
+sigma_b <- as.vector(posterior::as_draws_matrix(post)[, "sigma_b"])
+sigma_w <- as.vector(posterior::as_draws_matrix(post)[, "sigma_w"])
+
+db <- density(sigma_b)
+dw <- density(sigma_w)
+
+df <- data.frame(
+  sigma = c(sigma_b, sigma_w),
+  series = rep(c("Brent", "WTI"), each = length(sigma_b))
+)
+
+ggplot(df, aes(x = sigma, fill = series, color = series)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Posterior Volatility Comparison",
+       x = "Sigma",
+       y = "Density")
+
+
+mean(sigma_b > sigma_w)
+
+diff_sigma <- sigma_b - sigma_w
+
+mean(diff_sigma)
+
+quantile(diff_sigma, c(0.025, 0.5, 0.975))
+
+mean(diff_sigma > 0)
+
+p_trace_sigma <- mcmc_trace(fit$draws(c("sigma_b", "sigma_w"))) +
+  theme_minimal() +
+  labs(title = "Trace Plots: Brent vs. WTI (Student-t Scale)")
+
+
+p_trace_nu <- mcmc_trace(fit$draws(c("nu_b", "nu_w"))) +
+  theme_minimal() +
+  labs(title = "Trace Plots: Degrees of Freedom (nu)",
+       subtitle = "Lower nu means fatter tails")
+
+p_trace_mu <- mcmc_trace(fit$draws(c("mu_b", "mu_w"))) +
+  theme_minimal() +
+  labs(title = "Trace Plots: Mean Returns (mu)")
+
+```
+
+```{r}
+
+indicator_vector <- (sigma_b > sigma_w)
+
+prob_val <- mean(indicator_vector)
+
+prob_mcse <- mcse_mean(indicator_vector)
+
+summary_stats <- fit$summary(c("sigma_b", "sigma_w"))
+
+indicator <- (sigma_b > sigma_w)
+p_val <- mean(indicator)
+p_mcse <- mcse_mean(indicator)
+
+summary_df <- data.frame(
+  prob_gt    = p_val,
+  prob_mcse  = p_mcse                     
+)
+
+summary_stats <- fit$summary(c("sigma_b", "sigma_w"))
+
+summary_df <- data.frame(
+  mean_sig_b = summary_stats$mean[summary_stats$variable == "sigma_b"],
+  sd_sig_b   = summary_stats$sd[summary_stats$variable == "sigma_b"],
+  mean_sig_w = summary_stats$mean[summary_stats$variable == "sigma_w"],
+  sd_sig_w   = summary_stats$sd[summary_stats$variable == "sigma_w"],
+  rhat_b     = summary_stats$rhat[summary_stats$variable == "sigma_b"],
+  rhat_w     = summary_stats$rhat[summary_stats$variable == "sigma_w"],
+  prob_gt    = mean(sigma_b > sigma_w)
+)
+
+draws_df <- data.frame(sigma_b = sigma_b, sigma_w = sigma_w)
+
+ggplot(draws_df, aes(x = sigma_b, y = sigma_w)) +
+  geom_point(alpha = 0.1, color = "purple") + 
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Joint Posterior Distribution of Volatility",
+       subtitle = "Every draw confirms WTI volatility is higher than Brent",
+       x = "Estimated sigma (Brent)",
+       y = "Estimated sigma (WTI)") +
+  coord_fixed()
+
+```
+
+```{r}
+
+set.seed(1)
+S <- 20000 
+
+r_brent <- as.numeric(na.omit(r_brent))
+r_wti   <- as.numeric(na.omit(r_wti))
+
+loglik_t <- function(mu, sigma, nu, r) {
+  sum(dt((r - mu) / sigma, df = nu, log = TRUE) - log(sigma))
+}
+
+log_mean_exp <- function(x) {
+  x <- x[!is.na(x) & !is.infinite(x)]
+  if(length(x) == 0) return(-Inf)
+  m <- max(x)
+  m + log(mean(exp(x - m)))
+}
+
+
+mu_b_n    <- rnorm(S, 0.0005, 0.005)
+mu_w_n    <- rnorm(S, 0.0006, 0.005)
+sigma_b_n <- runif(S, 0.01, 0.03) 
+sigma_w_n <- runif(S, 0.01, 0.03)
+
+mu_b_t    <- rnorm(S, 0.0005, 0.005)
+mu_w_t    <- rnorm(S, 0.0006, 0.005)
+sigma_b_t <- runif(S, 0.01, 0.03)
+sigma_w_t <- runif(S, 0.01, 0.03)
+nu_b_t    <- runif(S, 2, 10) 
+nu_w_t    <- runif(S, 2, 10) 
+
+logw_n <- numeric(S)
+logw_t <- numeric(S)
+
+for (s in 1:S) {
+  logw_n[s] <- sum(dnorm(r_brent, mu_b_n[s], sigma_b_n[s], log = TRUE)) +
+               sum(dnorm(r_wti, mu_w_n[s], sigma_w_n[s], log = TRUE))
+  
+  logw_t[s] <- loglik_t(mu_b_t[s], sigma_b_t[s], nu_b_t[s], r_brent) +
+               loglik_t(mu_w_t[s], sigma_w_t[s], nu_w_t[s], r_wti)
+}
+
+logZ_n <- log_mean_exp(logw_n)
+logZ_t <- log_mean_exp(logw_t)
+BF <- logZ_t - logZ_n
+
+prob_t <- if (BF > 100) 1 else if (BF < -100) 0 else 1 / (1 + exp(-BF))
+
+
+```
+
+```{r}
+r <- r_brent
+r <- scale(r)
+r <- as.numeric(r)
+
+sv1<-"data {
+  int<lower=0> T;
+  vector[T] r;
+}
+
+parameters {
+  vector[T] z;
+  real mu;
+  real<lower=-0.9, upper=0.9> phi;
+  real<lower=0> sigma_h;
+}
+
+transformed parameters {
+  vector[T] h;
+
+  h[1] = mu + sigma_h * z[1] / sqrt(1 - square(phi));
+
+  for (t in 2:T)
+    h[t] = mu + phi * (h[t-1] - mu) + sigma_h * z[t];
+}
+
+model {
+  mu ~ normal(0, 1);
+  phi ~ normal(0, 0.5);
+  sigma_h ~ normal(0, 1);
+
+  z ~ normal(0, 1);
+
+  r ~ normal(0, exp(h / 2) + 1e-6);
+}
+"
+mod <- cmdstan_model(write_stan_file(sv1))
+
+fit_sv <- mod$sample(
+  data = list(T = length(r), r = r),
+  iter_sampling = 1000,
+  iter_warmup = 1000,
+  chains = 4,
+  adapt_delta = 0.95
+)
+
+
+
+```
+
+```{r}
+fit_sv$cmdstan_diagnose()
+sum_df <- fit_sv$summary()
+sum_df$rhat
+sum_df$ess_bulk
+sum_df$ess_tail
+
+draws <- fit_sv$draws()
+mcmc_trace(draws, pars = c("mu", "phi", "sigma_h"))
+```
+
+```{r}
+fit_sv$diagnostic_summary()
+fit_sv$summary(c("mu","phi","sigma_h"))
+```
+
+
+```{r}
+
+r_b <- 100 * r_b_lco
+r_w <- 100 * r_l_lco
+
+sv2_correlated<-
+"data {
+  int<lower=0> T;
+  vector[T] r_b;
+  vector[T] r_w;
+}
+
+parameters {
+  real mu_b;
+  real mu_w;
+
+  real<lower=-0.95, upper=0.95> phi_b;
+  real<lower=-0.95, upper=0.95> phi_w;
+
+  real<lower=0> sigma_b;
+  real<lower=0> sigma_w;
+
+  real<lower=-1, upper=1> rho;
+
+  // independent shocks
+  vector[T] z_b;
+  vector[T] z_w;
+}
+
+transformed parameters {
+  vector[T] h_b;
+  vector[T] h_w;
+
+  vector[T] eps_b;
+  vector[T] eps_w;
+
+  for (t in 1:T) {
+    eps_b[t] = z_b[t];
+    eps_w[t] = rho * z_b[t] + sqrt(1 - square(rho)) * z_w[t];
+  }
+
+  h_b[1] = mu_b;
+  h_w[1] = mu_w;
+
+  for (t in 2:T) {
+    h_b[t] = mu_b + phi_b * (h_b[t-1] - mu_b) + sigma_b * eps_b[t];
+    h_w[t] = mu_w + phi_w * (h_w[t-1] - mu_w) + sigma_w * eps_w[t];
+  }
+}
+
+model {
+  mu_b ~ normal(0, 1);
+  mu_w ~ normal(0, 1);
+
+  phi_b ~ normal(0, 0.3);
+  phi_w ~ normal(0, 0.3);
+
+  sigma_b ~ normal(0, 0.3);
+  sigma_w ~ normal(0, 0.3);
+
+  rho ~ normal(0, 0.3);
+
+  z_b ~ normal(0, 1);
+  z_w ~ normal(0, 1);
+
+  // likelihood
+  for (t in 1:T) {
+    r_b[t] ~ normal(0, exp(h_b[t] / 2) + 1e-3);
+    r_w[t] ~ normal(0, exp(h_w[t] / 2) + 1e-3);
+  }
+}
+"
+
+mod <- cmdstan_model(write_stan_file(sv2_correlated))
+
+fit_sv <- mod$sample(
+  data = list(
+    T = length(r_b),
+    r_b = as.numeric(r_b),
+    r_w = as.numeric(r_w)
+  ),
+  iter_sampling = 1000,
+  iter_warmup = 500,
+  chains = 1,
+  adapt_delta = 0.95
+)
+
+```
+
+
+```{r}
+
+post <- fit_sv$draws()
+post_mat <- as_draws_matrix(post)
+mu_b <- post_mat[, "mu_b"]
+mu_w <- post_mat[, "mu_w"]
+
+phi_b <- post_mat[, "phi_b"]
+phi_w <- post_mat[, "phi_w"]
+
+sigma_b <- post_mat[, "sigma_b"]
+sigma_w <- post_mat[, "sigma_w"]
+
+rho <- post_mat[, "rho"]
+
+summary_tbl <- data.frame(
+  param = c("mu_b","mu_w","phi_b","phi_w","sigma_b","sigma_w","rho"),
+  mean  = c(
+    mean(mu_b), mean(mu_w),
+    mean(phi_b), mean(phi_w),
+    mean(sigma_b), mean(sigma_w),
+    mean(rho)
+  ),
+  sd = c(
+    sd(mu_b), sd(mu_w),
+    sd(phi_b), sd(phi_w),
+    sd(sigma_b), sd(sigma_w),
+    sd(rho)
+  )
+)
+
+summary_tbl
+
+
+h_b <- post_mat[, grep("^h_b\\[", colnames(post_mat))]
+h_w <- post_mat[, grep("^h_w\\[", colnames(post_mat))]
+
+sigma_b_t <- exp(h_b / 2)
+sigma_w_t <- exp(h_w / 2)
+
+sigma_b_mean <- apply(sigma_b_t, 2, mean)
+sigma_w_mean <- apply(sigma_w_t, 2, mean)
+
+sigma_b_lower <- apply(sigma_b_t, 2, quantile, 0.025)
+sigma_b_upper <- apply(sigma_b_t, 2, quantile, 0.975)
+
+sigma_w_lower <- apply(sigma_w_t, 2, quantile, 0.025)
+sigma_w_upper <- apply(sigma_w_t, 2, quantile, 0.975)
+
+gap <- sigma_b_t - sigma_w_t
+
+gap_mean <- apply(gap, 2, mean)
+gap_ci_l <- apply(gap, 2, quantile, 0.025)
+gap_ci_u <- apply(gap, 2, quantile, 0.975)
+
+prob_b_gt_w <- colMeans(sigma_b_t > sigma_w_t)
+
+mean(rho)
+quantile(rho, c(0.025, 0.5, 0.975))
+
+
+vol_df <- tibble(
+  time = 1:length(sigma_b_mean),
+  sigma_b = sigma_b_mean,
+  sigma_w = sigma_w_mean,
+  gap = gap_mean,
+  prob_b_gt_w = prob_b_gt_w
+)
+
+```
+
+```{r}
+mv<-"data {
+  int<lower=0> T;
+  matrix[T,2] r;
+}
+
+parameters {
+  vector[2] mu;
+  vector<lower=-1, upper=1>[2] phi;
+  vector<lower=0>[2] sigma_h;
+  matrix[T,2] h_std;    
+  
+  real<lower=-1, upper=1> phi_x; 
+  real<lower=0> sigma_x;
+  vector[T] x_std;
+}
+
+model {
+  matrix[T,2] h;
+  vector[T] x;
+  
+  for (j in 1:2) h[1, j] = h_std[1, j] * sigma_h[j] / sqrt(1 - square(phi[j]));
+  for (t in 2:T) {
+    for (j in 1:2) h[t, j] = phi[j] * h[t-1, j] + sigma_h[j] * h_std[t, j];
+  }
+  
+  x[1] = x_std[1] * sigma_x / sqrt(1 - square(phi_x)); 
+  for (t in 2:T) x[t] = phi_x * x[t-1] + sigma_x * x_std[t];
+
+  mu ~ normal(0, 1);
+  phi ~ normal(0.9, 0.1);
+  sigma_h ~ exponential(5);
+  phi_x ~ normal(0.9, 0.1);
+  sigma_x ~ exponential(5);
+  to_vector(h_std) ~ std_normal();
+  x_std ~ std_normal();
+
+  for (t in 1:T) {
+    real s1 = exp(0.5 * h[t,1]);
+    real s2 = exp(0.5 * h[t,2]);
+    real r12 = 0.95 * (2 * inv_logit(x[t]) - 1);
+
+    real y1 = r[t,1] - mu[1];
+    real y2 = r[t,2] - mu[2];
+    real one_m_r2 = 1 - square(r12);
+
+    real det = square(s1) * square(s2) * one_m_r2;
+    real quad = square(y1 / s1) + square(y2 / s2) - 2 * r12 * (y1 * y2) / (s1 * s2);
+
+    target += -0.5 * (log(det) + quad / one_m_r2);
+  }
+}
+
+generated quantities {
+  vector[T] sigma1;
+  vector[T] sigma2;
+  vector[T] rho;
+
+  {
+    matrix[T,2] h_gen;
+    vector[T] x_gen;
+
+    for (j in 1:2) h_gen[1, j] = h_std[1, j] * sigma_h[j] / sqrt(1 - square(phi[j]));
+    for (t in 2:T) {
+      for (j in 1:2) h_gen[t, j] = phi[j] * h_gen[t-1, j] + sigma_h[j] * h_std[t, j];
+    }
+    
+    x_gen[1] = x_std[1] * sigma_x / sqrt(1 - square(phi_x)); 
+    for (t in 2:T) x_gen[t] = phi_x * x_gen[t-1] + sigma_x * x_std[t];
+
+    for (t in 1:T) {
+      sigma1[t] = exp(0.5 * h_gen[t,1]);
+      sigma2[t] = exp(0.5 * h_gen[t,2]);
+      rho[t] = 0.95 * (2 * inv_logit(x_gen[t]) - 1);
+    }
+  }
+}
+"
+
+mod <- cmdstan_model(write_stan_file(mv))
+
+r <- cbind(as.numeric(r_b_lco), as.numeric(r_l_lco))
+
+fit_sv <- mod$sample(
+  data = list(
+    T = nrow(r),
+    r = r
+  ),
+  iter_sampling = 1000,
+  iter_warmup = 500,
+  chains = 4,
+  adapt_delta = .95)
+
+```
+
+```{r}
+draws <- fit_sv$draws(c("rho", "sigma1", "sigma2"), format = "matrix")
+
+
+rho_summary   <- fit_sv$summary("rho")
+sig1_summary  <- fit_sv$summary("sigma1")
+sig2_summary  <- fit_sv$summary("sigma2")
+
+
+```
+
+```{r}
+
+rho_vec  <- rho_df  %>% arrange(t) %>% pull(rho)
+sig1_vec <- s1_df   %>% arrange(t) %>% pull(sigma_spot)
+sig2_vec <- s2_df   %>% arrange(t) %>% pull(sigma_futures)
+
+
+proof_df <- tibble(
+    r_b_lco = as.numeric(r_b_lco),
+    r_l_lco = as.numeric(r_l_lco),
+    rho           = rho_vec,
+    sigma_spot    = sig1_vec,
+    sigma_futures = sig2_vec
+  ) %>%
+  mutate(
+    t         = row_number(),
+    basis     = r_b_lco - r_l_lco,
+    vol_ratio = sigma_spot / sigma_futures
+  )
+
+
+summary(proof_df$rho)
+
+ggplot(proof_df, aes(x = t)) +
+  geom_line(aes(y = rho, color = "Correlation (rho)")) +
+  geom_line(aes(y = basis / max(abs(basis)), color = "Normalized Basis")) +
+  theme_minimal() 
+```
+
+```{r}
+
+plot_data <- proof_df %>% tail(1500) 
+
+p1 <- ggplot(plot_data, aes(x = t, y = basis)) +
+  geom_area(fill = "firebrick", alpha = 0.3) +
+  geom_line(color = "firebrick") +
+  labs(title = "Basis", y = "Spot - Futures") +
+  theme_minimal()
+
+p2 <- ggplot(plot_data, aes(x = t, y = rho)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_hline(yintercept = 0.8, linetype = "dashed") +
+  labs(title = "Time-Varying rho", y = "Correlation") +
+  theme_minimal()
+
+p1 / p2
+
+regime_check <- proof_df %>%
+  mutate(regime = if_else(basis < quantile(basis, 0.05, na.rm=TRUE), "Stress", "Normal")) %>%
+  group_by(regime) %>%
+  summarise(
+    avg_correlation = mean(rho),
+    avg_vol_ratio = mean(vol_ratio),
+    n_days = n()
+  )
+
+
+```
+
+
+
+
+
+```{r}
+
+scalar_pars <- c("mu[1]", "mu[2]", "phi[1]", "phi[2]", 
+                 "sigma_h[1]", "sigma_h[2]", "phi_x", "sigma_x")
+
+draws_scalars <- fit_sv$draws(variables = scalar_pars)
+
+mcmc_trace(draws_scalars)
+mcmc_pairs(draws_scalars, pars = c("phi[1]", "phi[2]", "sigma_h[1]", "sigma_h[2]"))
+
+s1_summary <- fit_sv$summary("sigma1", "mean", ~quantile(.x, probs = c(0.05, 0.95)))
+s2_summary <- fit_sv$summary("sigma2", "mean", ~quantile(.x, probs = c(0.05, 0.95)))
+rho_summary <- fit_sv$summary("rho", "mean", ~quantile(.x, probs = c(0.05, 0.95)))
+
+colnames(s1_summary)[3:4] <- c("low", "high")
+colnames(s2_summary)[3:4] <- c("low", "high")
+colnames(rho_summary)[3:4] <- c("low", "high")
+
+plot(s1_summary$mean, type="l", col="blue", 
+     ylim = c(0, max(s1_summary$high, s2_summary$high)),
+     main = "Volatility Paths", ylab = "Sigma", xlab = "Time")
+lines(s1_summary$low, lty=2, col="blue")
+lines(s1_summary$high, lty=2, col="blue")
+
+lines(s2_summary$mean, col="red")
+lines(s2_summary$low, lty=2, col="red")
+lines(s2_summary$high, lty=2, col="red")
+legend("topright", legend=c("Market 1", "Market 2"), col=c("blue", "red"), lty=1)
+
+vol_ratio <- s1_summary$mean / s2_summary$mean
+plot(vol_ratio, type = "l", main = "Relative Volatility (M1 / M2)", 
+     ylab = "Ratio", xlab = "Time")
+abline(h = 1, lty = 2)
+
+plot(rho_summary$mean, type = "l", ylim = c(-1, 1),
+     main = "Time-Varying Correlation", ylab = "rho(t)", xlab = "Time")
+lines(rho_summary$low, lty = 2, col = "gray")
+lines(rho_summary$high, lty = 2, col = "gray")
+abline(h = 0, lty = 3)
+
+summary_df <- data.frame(
+  mean_rho         = mean(rho_summary$mean),
+  sd_rho           = sd(rho_summary$mean),
+  mean_vol_ratio   = mean(vol_ratio),
+  max_sigma1_value = max(s1_summary$mean),
+  max_sigma2_value = max(s2_summary$mean),
+  max_sigma1_time  = which.max(s1_summary$mean),
+  max_sigma2_time  = which.max(s2_summary$mean),
+  max_rho_time     = which.max(rho_summary$mean)
+)
+
+print(summary_df)
+```
+
+
+
+```{r}
+
+common_bw_numeric <- intersect(dates_brent, dates_wti)
+
+plot_dates <- as.Date(common_bw_numeric, origin = "1970-01-01")
+
+par(mar = c(4.5, 4.5, 2, 1))
+plot(plot_dates, s1_summary$mean, type="l", col="blue", 
+     ylim = c(0, max(s1_summary$high, s2_summary$high)),
+     main = "Volatility: Brent vs LCO", ylab = "Volatility (Sigma)", xlab = "Date")
+lines(plot_dates, s1_summary$low, lty=2, col="blue")
+lines(plot_dates, s1_summary$high, lty=2, col="blue")
+lines(plot_dates, s2_summary$mean, col="red")
+lines(plot_dates, s2_summary$low, lty=2, col="red")
+lines(plot_dates, s2_summary$high, lty=2, col="red")
+legend("topright", legend=c("Brent Spot", "LCO Futures"), col=c("blue", "red"), lty=1, bty="n")
+dev.off()
+
+par(mar = c(4.5, 4.5, 2, 1))
+plot(plot_dates, vol_ratio, type = "l", 
+     main = "Volatility Ratio (Brent Spot / LCO Futures)", 
+     ylab = "Ratio", xlab = "Date", col = "darkgreen")
+abline(h = 1, lty = 2, col = "black")
+dev.off()
+
+par(mar = c(4.5, 4.5, 2, 1))
+plot(plot_dates, rho_summary$mean, type = "l", ylim = c(0, 1), 
+     main = "Time-Varying Correlation (Brent/LCO)", ylab = "Correlation (rho)", xlab = "Date", col = "purple")
+lines(plot_dates, rho_summary$low, lty = 2, col = "purple", lwd = 0.5)
+lines(plot_dates, rho_summary$high, lty = 2, col = "purple", lwd = 0.5)
+dev.off()
+
+
+summary_df_final <- data.frame(
+  Metric = c("Mean Correlation", "Mean Vol Ratio", "Max Brent Vol", "Max LCO Vol", "Max Correlation"),
+  Value = c(mean(rho_summary$mean), mean(vol_ratio), max(s1_summary$mean), max(s2_summary$mean), max(rho_summary$mean)),
+  Date = c(NA, NA, 
+           as.character(plot_dates[which.max(s1_summary$mean)]), 
+           as.character(plot_dates[which.max(s2_summary$mean)]), 
+           as.character(plot_dates[which.max(rho_summary$mean)]))
+)
+
+grid.newpage()
+grid.table(summary_df_final)
+dev.off()
+
+
+colnames(summary_df) <- c("Mean $\\rho$", "SD $\\rho$", "Mean Vol Ratio", 
+                          "Max $\\sigma_1$", "Max $\\sigma_2$", 
+                          "T (Max $\\sigma_1$)", "T (Max $\\sigma_2$)", "T (Max $\\rho$)")
+
+cat(kable(summary_df, format = "latex", booktabs = TRUE, escape = FALSE, 
+      digits = 4, caption = "Summary Statistics of Bivariate SV Model"))
+
+png("5_MCMC_Trace_Scalars.png", width = 1200, height = 1400, res = 150)
+print(mcmc_trace(draws_scalars))
+dev.off()
+
+png("6_MCMC_Pairs_Scalars.png", width = 1200, height = 1200, res = 150)
+
+
+print(mcmc_pairs(draws_scalars, 
+                 pars = c("phi[1]", "phi[2]", "sigma_h[1]", "sigma_h[2]"),
+                 off_diag_args = list(size = 0.5, alpha = 0.2))) # Makes dots smaller/lighter
+
+dev.off()
+
+```
+
+
+
+```{r}
+scalar_pars <- c("mu", "phi", "sigma_h", "phi_x", "sigma_x")
+
+summary_scalars <- fit_sv$summary(variables = scalar_pars)
+
+diagnostics_list <- list(
+  max_rhat = max(summary_scalars$rhat, na.rm = TRUE),
+  min_ess_bulk = min(summary_scalars$ess_bulk, na.rm = TRUE),
+  min_ess_tail = min(summary_scalars$ess_tail, na.rm = TRUE)
+)
+
+
+```

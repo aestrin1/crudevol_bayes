@@ -55,7 +55,7 @@ r_t \sim \mathcal{N}(\mu, \sigma)
 \sigma \sim \text{Half-Cauchy}(0, 2.5)
 \]
 
-### Model 2 (heavy-tailed)
+### Mopdel 2 (heavy-tailed)
 
 \
 **Likelihood:**
@@ -89,13 +89,11 @@ wti <- read.csv("../data/DCOILWTICO.csv") %>%
   na.omit()
 
 brent <- read.csv("../data/brent-daily.csv") %>%
-  rename(date = Date, price = Price) %>%
-  mutate(date = as.Date(date),
-         price = as.numeric(price),
-         return = c(NA, diff(log(price)))) %>%
+  mutate(Date = as.Date(Date),
+         Price = as.numeric(Price),
+         Return = c(NA, diff(log(Price)))) %>%
   na.omit()
 
-merged_data <- merge(wti, brent, by = "date", suffixes = c("_WTI", "_COIL"))
-head(merged_data, 6)
-
+head(wti)
+head(brent)
 ```

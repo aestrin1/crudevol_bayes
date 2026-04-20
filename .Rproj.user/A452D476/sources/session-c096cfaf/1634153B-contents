@@ -1,0 +1,143 @@
+---
+title: "Bayesian Modeling of Oil Price Volatility"
+author: "Ariel Estrin"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(quantmod)
+library(readr)
+library(rstan)
+library(cmdstanr)
+library(bayesplot)
+library(coda)
+library(ggplot2)
+
+source("../func/simple_utils.R")
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+Oil markets experience large fluctuations and periods of increased uncertainty.
+This project studies volatility in the globalcrude oil benchmarks West Texas Intermediate (WTI) and/or Brent (COIL). 
+
+This project studies volatility in crude oil markets using Bayesian methods. I analyze daily prices of crude oil benchmarks obtained from the Federal Reserve Bank of St. Louis FRED database for WTI or, alternatively, an open-source csv file tracking Brent. After converting prices to log returns, I hope to use two Bayesian models: a simple normal return model and a heavy-tailed model. Posterior inference will be computed using two different approaches: a basic Metropolis–Hastings MCMC sampler and perhaps a Hamiltonian Monte Carlo. I will compare these approaches using effective sample size, convergence diagnostics, and computational efficiency. The goal is to evaluate whether heavy-tailed models provide a better description of oil price fluctuations and to assess the efficiency gains of modern Bayesian computation methods.
+
+
+# Data
+
+```{r}
+
+wti<-read.csv("../data/DCOILWTICO.csv")
+wti <- wti %>%
+  rename(date = observation_date, price = DCOILWTICO) %>%
+  mutate(
+    date = as.Date(date),
+    price = as.numeric(price),
+    return = c(NA, diff(log(price)))
+  ) %>%
+  na.omit()
+head(wti)
+
+
+brent<-read.csv("../data/brent-daily.csv")
+brent<-brent %>%
+  mutate(
+    Date = as.Date(Date),
+    Price = as.numeric(Price),
+    Return = c(NA, diff(log(Price)))
+  ) %>%
+  na.omit()
+head(brent) 
+
+```
+# Scientific Question(s)
+
+This project will address the following questions:
+
+- What is the estimated volatility of daily oil price returns?
+
+- Do oil returns exhibit heavy tails relative to a normal distribution?
+
+- Does a more flexible model improve the fit to the observed return distribution?
+
+- How do different Bayesian computation methods compare in terms of efficiency and convergence?
+
+## Bayesian Models
+
+Two models will be considered.
+
+### Model 1: Normal Return Model (Baseline)
+
+This model assumes that returns follow a normal distribution with constant volatility.
+
+$$
+r_t \sim \mathcal{N}(\mu, \sigma)
+$$
+
+**Priors**
+
+$$
+\mu \sim \mathcal{N}(0, 10)
+$$
+
+$$
+\sigma \sim \text{Half-Cauchy}(0, 2.5)
+$$
+
+---
+
+### Model 2: Student-t Return Model (Heavy-Tailed)
+
+This model allows for heavy tails, which are common in financial return data.
+
+$$r_t \sim N(\mu, \sigma)$$
+
+where:
+
+- \( \mu \) is the mean return  
+- \( \sigma \) is the scale parameter  
+- \( \nu \) controls the heaviness of the tails  
+
+**Priors**
+
+\[
+\mu \sim \mathcal{N}(0, 10)
+\]
+
+\[
+\sigma \sim \text{Half-Cauchy}(0, 2.5)
+\]
+
+\[
+\nu \sim \text{Exponential}(1)
+\]
+
+Posterior Computation
+
+The posterior distribution will be computed using two different methods.
+
+Method 1:  Metropolis–Hastings sampler
+
+
+Method 2: Hamiltonian Monte Carlo
+
+Posterior sampling will also be performed using Stan, which implements Hamiltonian Monte Carlo (HMC).
+
+
+## Comparison of Methods
+
+The two sampling methods will be compared using:
+
+- Effective sample size
+
+- Convergence diagnostics (trace plots, etc.)
+
+- Posterior variance estimates
+
+- Computational time
+
+

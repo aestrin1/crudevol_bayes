@@ -1,0 +1,8 @@
+"0",""
+"0","oil<-read.csv(""../data/DCOILWTICO.csv"")"
+"0","oil <- oil %>%"
+"0","  rename(date = observation_date, price = DCOILWTICO) %>%"
+"0","  mutate(price = as.numeric(price),"
+"0","         return = c(NA, diff(log(price)))) %>%"
+"0","  na.omit()"
+"0","head(oil)"
